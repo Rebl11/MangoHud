@@ -5,7 +5,7 @@
 #include "backends/imgui_impl_opengl3.h"
 #include "vk.h"
 #include "egl.h"
-
+#include <cstdio>
 #include <algorithm>
 #include <cmath>
 
@@ -37,14 +37,41 @@ static void draw_graph(const TextCell& cell, const ImRect& content, ImVec2 origi
             ImPlot::PushStyleColor(ImPlotCol_FrameBg, {0, 0, 0, 0});
             if (ImPlot::BeginPlot("frametimes", size,
                                   ImPlotFlags_CanvasOnly | ImPlotFlags_NoInputs)) {
-                ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_NoDecorations,
+                ImPlot::SetupAxes(nullptr, nullptr,
+                                  ImPlotAxisFlags_NoDecorations,
                                   ImPlotAxisFlags_NoDecorations);
-                ImPlot::SetupAxisScale(
-                    ImAxis_Y1, [](double v, void*) { return std::min(v, 49.9); },
-                    [](double v, void*) { return v; });
-                ImPlot::SetupAxesLimits(0, 200, 0, 50, ImGuiCond_Always);
+                if (cell.graph_min && cell.graph_max) {
+                    ImPlot::SetupAxisLimits(
+                        ImAxis_Y1,
+                        *cell.graph_min,
+                        *cell.graph_max,
+                        ImGuiCond_Always);
+                }
+                if (!cell.timestamps.empty() &&
+                    cell.timestamps.size() == cell.data.size()) {
+                    // Historical scalar metrics: use elapsed time as the X axis.
+                    double x_min = cell.timestamps.front();
+                double x_max = cell.timestamps.back();
+
+                // Give a single-sample graph a visible X range.
+                if (x_min == x_max) {
+                    x_min -= 250.0;
+                    x_max += 250.0;
+                }
+
+                ImPlot::SetupAxisLimits(ImAxis_X1, x_min, x_max, ImGuiCond_Always);
                 ImPlot::SetNextLineStyle({0, 1, 0, 1}, 2);
-                ImPlot::PlotLine("frametime", cell.data.data(), cell.data.size());
+                ImPlot::PlotLine("metric", cell.timestamps.data(),
+                                 cell.data.data(), static_cast<int>(cell.data.size()));
+                    } else {
+                        // Existing frametime graph behavior.
+                        ImPlot::SetupAxisScale(
+                            ImAxis_Y1, [](double v, void*) { return std::min(v, 49.9); },
+                                               [](double v, void*) { return v; });
+                        ImPlot::SetupAxesLimits(0, 200, 0, 50, ImGuiCond_Always);
+                        ImPlot::SetNextLineStyle({0, 1, 0, 1}, 2);
+                        ImPlot::PlotLine("frametime", cell.data.data(), cell.data.size());
+                    }
                 ImPlot::EndPlot();
             }
             ImPlot::PopStyleColor(2);
@@ -56,9 +83,168 @@ static void draw_graph(const TextCell& cell, const ImRect& content, ImVec2 origi
     ImGui::PopID();
 }
 
+
+static void draw_graph(const GraphCell& cell, const ImRect& bounds, ImVec2 origin) {
+    ImGui::SetCursorScreenPos(origin + bounds.Min);
+    ImGui::PushID(&cell);
+
+    const ImVec2 size{bounds.GetWidth(), bounds.GetHeight()};
+
+    if (size.x > 0.0f && size.y > 0.0f) {
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+
+        if (ImGui::BeginChild(
+            "metric_graph", size, false,
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground)) {
+            constexpr float label_width = 42.0f;
+        const ImVec2 plot_size{
+            std::max(0.0f, size.x - label_width),
+            size.y
+        };
+
+        ImPlot::PushStyleVar(ImPlotStyleVar_PlotPadding, {0, 0});
+        ImPlot::PushStyleColor(ImPlotCol_PlotBg, {0, 0, 0, 0});
+        ImPlot::PushStyleColor(ImPlotCol_FrameBg, {0, 0, 0, 0});
+
+        double display_y_min = 0.0;
+        double display_y_max = 0.0;
+        bool has_y_limits = false;
+
+        if (ImPlot::BeginPlot(
+            "metric_graph_plot", plot_size,
+            ImPlotFlags_CanvasOnly | ImPlotFlags_NoInputs)) {
+            ImPlot::SetupAxes(
+                nullptr,
+                nullptr,
+                ImPlotAxisFlags_NoDecorations,
+                ImPlotAxisFlags_NoLabel |
+                ImPlotAxisFlags_NoTickMarks |
+                ImPlotAxisFlags_NoTickLabels);
+
+            if (!cell.data.empty()) {
+                const auto [data_min_it, data_max_it] =
+                std::minmax_element(cell.data.begin(), cell.data.end());
+
+                const double data_min = *data_min_it;
+                const double data_max = *data_max_it;
+                const double range = data_max - data_min;
+
+                const double padding =
+                range > 0.0
+                ? range * 0.05
+                : std::max(std::abs(data_min) * 0.05, 1.0);
+
+                const double y_min =
+                cell.min.value_or(static_cast<float>(data_min - padding));
+                const double y_max =
+                cell.max.value_or(static_cast<float>(data_max + padding));
+
+                display_y_min = y_min;
+                display_y_max = y_max;
+                has_y_limits = y_min < y_max;
+
+                if (has_y_limits) {
+                    ImPlot::SetupAxisLimits(
+                        ImAxis_Y1, y_min, y_max, ImGuiCond_Always);
+                }
+            }
+
+            if (!cell.timestamps.empty() &&
+                cell.timestamps.size() == cell.data.size()) {
+                double x_min = cell.timestamps.front();
+            double x_max = cell.timestamps.back();
+
+            if (x_min == x_max) {
+                x_min -= 250.0;
+                x_max += 250.0;
+            }
+
+            ImPlot::SetupAxisLimits(
+                ImAxis_X1, x_min, x_max, ImGuiCond_Always);
+            ImPlot::SetNextLineStyle({0, 1, 0, 1}, 2);
+            ImPlot::PlotLine(
+                "metric", cell.timestamps.data(), cell.data.data(),
+                             static_cast<int>(cell.data.size()));
+                } else if (!cell.data.empty()) {
+                    // Vector-based metrics, such as FRAMETIMES.
+                    ImPlot::SetupAxesLimits(0, 200, 0, 50, ImGuiCond_Always);
+                    display_y_min = 0.0;
+                    display_y_max = 50.0;
+                    has_y_limits = true;
+
+                    ImPlot::SetNextLineStyle({0, 1, 0, 1}, 2);
+                    ImPlot::PlotLine(
+                        "metric", cell.data.data(),
+                                     static_cast<int>(cell.data.size()));
+                }
+
+                ImPlot::EndPlot();
+
+                if (has_y_limits) {
+                    char min_label[32];
+                    char max_label[32];
+
+                    std::snprintf(
+                        min_label, sizeof(min_label), "%.3g", display_y_min);
+                    std::snprintf(
+                        max_label, sizeof(max_label), "%.3g", display_y_max);
+
+                    auto* draw = ImGui::GetWindowDrawList();
+                    const float font_size = ImGui::GetFontSize() * 0.8f;
+                    const ImVec2 padding{4.0f, 2.0f};
+                    const ImVec2 child_pos = ImGui::GetWindowPos();
+                    const ImVec2 child_size = ImGui::GetWindowSize();
+
+                    const ImVec2 max_text_size =
+                    ImGui::GetFont()->CalcTextSizeA(
+                        font_size, FLT_MAX, 0.0f, max_label);
+                    const ImVec2 min_text_size =
+                    ImGui::GetFont()->CalcTextSizeA(
+                        font_size, FLT_MAX, 0.0f, min_label);
+
+                    const ImU32 text_color = IM_COL32(255, 255, 255, 190);
+                    const ImU32 outline_color = IM_COL32(0, 0, 0, 220);
+
+                    const ImVec2 max_pos{
+                        child_pos.x + child_size.x - max_text_size.x - padding.x,
+                        child_pos.y + padding.y
+                    };
+
+                    const ImVec2 min_pos{
+                        child_pos.x + child_size.x - min_text_size.x - padding.x,
+                        child_pos.y + child_size.y - min_text_size.y - padding.y
+                    };
+
+                    for (const auto& [label, pos] :
+                    {std::pair{max_label, max_pos},
+                    std::pair{min_label, min_pos}}) {
+                        draw->AddText(
+                            ImGui::GetFont(), font_size,
+                                      pos + ImVec2{1.0f, 1.0f}, outline_color, label);
+                        draw->AddText(
+                            ImGui::GetFont(), font_size, pos, text_color, label);
+                    }
+                }
+            }
+
+            ImPlot::PopStyleColor(2);
+            ImPlot::PopStyleVar();
+            }
+
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+    }
+
+    ImGui::PopID();
+}
+
 static void draw_content(const HudLayout& layout, ImVec2 origin) {
     auto& draw = *ImGui::GetWindowDrawList();
-    for (const auto& row : layout.rows)
+
+    for (const auto& row : layout.rows) {
+        if (row.graph && row.graph->graph)
+            draw_graph(*row.graph->graph, row.graph->bounds, origin);
+
         for (const auto& cell : row.cells) {
             if (const auto* progress = std::get_if<ProgressCell>(cell.cell)) {
                 auto bar = cell.progress;
@@ -86,6 +272,7 @@ static void draw_content(const HudLayout& layout, ImVec2 origin) {
                              IM_COL32(0, 220, 255, 255));
             }
         }
+    }
 }
 
 static void draw_separators(const HudLayout& layout, ImVec2 origin) {

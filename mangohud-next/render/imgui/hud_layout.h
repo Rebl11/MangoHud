@@ -32,9 +32,15 @@ struct HudCellLayout {
     std::unique_ptr<HudLayout> nested;
 };
 
+struct HudGraphLayout {
+    const GraphCell* graph = nullptr;
+    ImRect bounds{0, 0, 0, 0};
+};
+
 struct HudRowLayout {
     ImRect bounds{0, 0, 0, 0};
     std::vector<HudCellLayout> cells;
+    std::optional<HudGraphLayout> graph;
 };
 
 struct HudLayout {

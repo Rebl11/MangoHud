@@ -52,6 +52,9 @@ struct TextCell {
     ImVec4 vec;
     std::string unit;
     std::vector<float> data;
+    std::vector<float> timestamps;
+    std::optional<float> graph_min;
+    std::optional<float> graph_max;
     CellStyle style;
 };
 
@@ -74,13 +77,17 @@ struct FormatCell {
 
 struct GraphCell {
     MetricRef ref;
-    std::string graph;
-    int width = 0;
-    int height = 0;
-    int min = 0;
-    int max = 0;
-    uint32_t color;
+
+    // Configuration
+    std::optional<float> min;
+    std::optional<float> max;
+    int height = 50;
     CellStyle style;
+
+    // Resolved metric history
+    std::vector<float> data;
+    std::vector<float> timestamps;
+    ImVec4 vec{};
 };
 
 using ProgressBound = std::variant<float, MetricRef>;
@@ -121,6 +128,11 @@ struct TableCell {
 using Cell = std::variant<TextCell, ValueCell, FormatCell, GraphCell, ProgressCell, ExecCell, TableCell>;
 using MaybeCell = std::optional<Cell>;
 
+struct HudTableRow {
+    std::vector<MaybeCell> cells;
+    std::optional<GraphCell> graph;
+};
+
 struct hudTable {
     float padding = 0.0f;
     int cols = 0;
@@ -129,7 +141,7 @@ struct hudTable {
     float row_gap = -2.0f;
     bool debug_cell_boxes = false;
     bool trim_background = false;
-    std::vector<std::vector<MaybeCell>> rows;
+    std::vector<HudTableRow> rows;
 };
 
 struct HudWindow {

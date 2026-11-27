@@ -91,7 +91,7 @@ static MeasuredCell measure_cell(const Cell& cell, int column, int cols, const h
     if (const auto* text = std::get_if<TextCell>(&cell)) {
         measured.has_content |= !text->text.empty() || !text->data.empty();
         if (!text->data.empty())
-            measured.minimum = {100.0f, 50.0f};
+            measured.minimum = {0.0f, 50.0f};
         else {
             auto* font = fonts.get(size);
             const auto reference = font_bounds(font, size);
@@ -227,7 +227,7 @@ const CellStyle& hud_cell_style(const Cell& cell) {
 ImVec2 prepare_hud_fonts(const hudTable& table, Font& fonts) {
     ImVec2 extent{};
     for (const auto& row : table.rows)
-        for (const auto& cell : row) {
+        for (const auto& cell : row.cells) {
             if (!cell)
                 continue;
             const auto& style = hud_cell_style(*cell);
@@ -249,10 +249,11 @@ HudLayout layout_hud(const hudTable& table, Font& fonts) {
     const int cols = std::max(0, table.cols);
     std::vector<bool> reserve_overrides(cols);
     for (const auto& row : table.rows)
-        for (int c = 0; c < cols && c < static_cast<int>(row.size()); c++) {
-            if (!row[c])
+        for (int c = 0; c < cols && c < static_cast<int>(row.cells.size()); c++) {
+            if (!row.cells[c])
                 continue;
-            const auto& style = hud_cell_style(*row[c]);
+
+            const auto& style = hud_cell_style(*row.cells[c]);
             if (style.value_reserve_override)
                 reserve_overrides[c + std::min(std::max(1, style.colspan), cols - c) - 1] = true;
         }
@@ -261,15 +262,21 @@ HudLayout layout_hud(const hudTable& table, Font& fonts) {
     std::vector<float> left_insets(cols), right_insets(cols);
     std::vector<float> widths(cols), heights, unit_widths(cols), value_widths(cols),
         column_insets(cols);
-    for (const auto& row : table.rows) {
-        auto& cells = rows.emplace_back();
-        float height = 0.0f;
-        for (int c = 0; c < cols && c < static_cast<int>(row.size());) {
-            if (!row[c]) {
+        for (const auto& row : table.rows) {
+            auto& cells = rows.emplace_back();
+
+            if (row.graph) {
+                heights.push_back(static_cast<float>(std::max(1, row.graph->height)));
+                continue;
+            }
+
+            float height = 0.0f;
+            for (int c = 0; c < cols && c < static_cast<int>(row.cells.size());) {
+            if (!row.cells[c]) {
                 ++c;
                 continue;
             }
-            auto cell = measure_cell(*row[c], c, cols, table, fonts, reserve_overrides);
+            auto cell = measure_cell(*row.cells[c], c, cols, table, fonts, reserve_overrides);
             if (cell.layout.separator_text) {
                 const auto& run = *cell.layout.separator_text;
                 auto& gap = gaps[c + cell.span - 1];
@@ -340,10 +347,26 @@ HudLayout layout_hud(const hudTable& table, Font& fonts) {
     result.size.x = cols ? x.back() - gaps.back() : 0.0f;
     float y = 0.0f;
     for (std::size_t r = 0; r < rows.size(); r++) {
+        const auto& source_row = table.rows[r];
         auto& out = result.rows.emplace_back();
+
         const float height = heights[r];
-        const float step = r + 1 == rows.size() ? height : std::max(0.0f, height + table.row_gap);
-        out.bounds = {0.0f, y, 0.0f, y + height};
+        const float step = r + 1 == rows.size()
+        ? height
+        : std::max(0.0f, height + table.row_gap);
+
+        out.bounds = {0.0f, y, result.size.x, y + height};
+
+        if (source_row.graph) {
+            out.graph = HudGraphLayout{
+                .graph = &*source_row.graph,
+                .bounds = {0.0f, y, result.size.x, y + height},
+            };
+
+            result.size.y = std::max(result.size.y, out.bounds.Max.y);
+            y += step;
+            continue;
+        }
         for (auto& cell : rows[r]) {
             auto& layout = cell.layout;
             const float width =

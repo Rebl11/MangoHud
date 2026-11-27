@@ -60,16 +60,29 @@ static bool validate_table(const YAML::Node& table) {
     }
 
     for (const auto& row : rows) {
+        if (row.IsMap()) {
+            if (!row["graph"]) {
+                SPDLOG_ERROR("graph row must contain a graph metric");
+                return false;
+            }
+
+            continue;
+        }
+
         if (!row.IsSequence()) {
-            SPDLOG_ERROR("row is not a list");
+            SPDLOG_ERROR("row must be a list or graph object");
             return false;
         }
+
         for (const auto& cell : row) {
-            if (cell.IsNull()) continue;
+            if (cell.IsNull())
+                continue;
+
             if (!cell.IsMap()) {
                 SPDLOG_ERROR("cell must be null or a map/object");
                 return false;
             }
+
             if (cell["table"] && !validate_table(cell["table"]))
                 return false;
         }
@@ -266,6 +279,25 @@ static bool parse_table_node(hudTable& table, YAML::Node table_node, int font_si
     std::size_t cols = 0;
     for (auto row : rows) {
         std::vector<MaybeCell> parsed_row;
+        if (row.IsMap()) {
+            GraphCell graph;
+            graph.ref = parse_value(row["graph"]);
+
+            if (row["min"])
+                graph.min = row["min"].as<float>();
+
+            if (row["max"])
+                graph.max = row["max"].as<float>();
+
+            if (row["height"])
+                graph.height = std::max(1, row["height"].as<int>());
+
+            table.rows.push_back(HudTableRow{
+                .cells = {},
+                .graph = std::move(graph),
+            });
+            continue;
+        }
 
         for (auto cell : row) {
             if (cell.IsNull()) {
@@ -336,6 +368,13 @@ static bool parse_table_node(hudTable& table, YAML::Node table_node, int font_si
             if (cell["graph"]) {
                 GraphCell gc;
                 gc.ref = parse_value(cell["graph"]);
+
+                if (cell["min"])
+                    gc.min = cell["min"].as<int>();
+
+                if (cell["max"])
+                    gc.max = cell["max"].as<int>();
+
                 gc.style = parse_cell_style(cell);
                 parsed_row.push_back(Cell{gc});
                 append_colspan_placeholders(parsed_row, gc.style);
@@ -382,7 +421,10 @@ static bool parse_table_node(hudTable& table, YAML::Node table_node, int font_si
         }
 
         cols = std::max(cols, parsed_row.size());
-        table.rows.push_back(parsed_row);
+        table.rows.push_back(HudTableRow{
+            .cells = std::move(parsed_row),
+                             .graph = std::nullopt,
+        });
     }
 
     table.cols = cols;

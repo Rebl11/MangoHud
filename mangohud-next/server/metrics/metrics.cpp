@@ -13,6 +13,39 @@
 #include "../common/helpers.hpp"
 #include "string_utils.h"
 
+static constexpr size_t MAX_METRIC_HISTORY = 120;
+
+static void record_metric_history(
+    const MetricTable& source,
+    MetricHistoryTable& history,
+    std::chrono::steady_clock::time_point timestamp)
+{
+    for (const auto& [group, metric_table] : source) {
+        for (const auto& [name, metric] : metric_table) {
+            if (!metric.val)
+                continue;
+
+            double value;
+
+            if (const auto* v = std::get_if<int>(&*metric.val))
+                value = *v;
+            else if (const auto* v = std::get_if<uint64_t>(&*metric.val))
+                value = static_cast<double>(*v);
+            else if (const auto* v = std::get_if<float>(&*metric.val))
+                value = *v;
+            else
+                continue;
+
+            auto& samples = history[group][name];
+
+            samples.push_back({timestamp, value});
+
+            if (samples.size() > MAX_METRIC_HISTORY)
+                samples.pop_front();
+        }
+    }
+}
+
 static TextCell format_metrics(const FormatCell& cell, const std::vector<Metric>& values) {
     TextCell out;
     out.style = cell.style;
@@ -114,6 +147,49 @@ static std::string metrics_to_json(const MetricTable::mapped_type& metrics) {
     return out;
 }
 
+static std::string metric_history_to_json(const MetricHistoryTable::mapped_type& history) {
+    std::string out = "{";
+    bool first = true;
+
+    for (const auto& [key, samples] : history) {
+        if (!first)
+            out.push_back(',');
+        first = false;
+
+        append_json_string(out, key);
+        out += R"(:{"timestamps_ms":[)";
+
+            if (!samples.empty()) {
+                const auto origin = samples.front().timestamp;
+
+                for (size_t i = 0; i < samples.size(); ++i) {
+                    if (i)
+                        out.push_back(',');
+
+                    const auto elapsed =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        samples[i].timestamp - origin).count();
+
+                        append_json_value(out, elapsed);
+                }
+            }
+
+            out += R"(],"values":[)";
+
+            for (size_t i = 0; i < samples.size(); ++i) {
+                if (i)
+                    out.push_back(',');
+
+                append_json_value(out, samples[i].value);
+            }
+
+            out += "]}";
+        }
+
+        out.push_back('}');
+        return out;
+}
+
 Metrics::Metrics(IPCServer& ipc, std::shared_ptr<Config> cfg_) : cfg(cfg_), ipc(ipc) {
     client_thread     = std::thread(&Metrics::update_client, this);
     pthread_setname_np(client_thread.native_handle(), "update_client");
@@ -197,8 +273,29 @@ void Metrics::update() {
 
         {
             std::lock_guard lock(m);
-            new_metrics.swap(metrics);
-            new_gpu_metrics.swap(client_gpu_metrics);
+
+            const auto timestamp = std::chrono::steady_clock::now();
+
+            record_metric_history(new_metrics, metrics_history, timestamp);
+
+            for (const auto& [pid, gpu_metrics] : new_gpu_metrics) {
+                record_metric_history(
+                    gpu_metrics,
+                    client_gpu_metrics_history[pid],
+                    timestamp);
+            }
+
+            // Remove history belonging to processes no longer reporting GPU metrics.
+            for (auto it = client_gpu_metrics_history.begin();
+                 it != client_gpu_metrics_history.end();) {
+                if (new_gpu_metrics.find(it->first) == new_gpu_metrics.end())
+                    it = client_gpu_metrics_history.erase(it);
+                else
+                    ++it;
+                 }
+
+                 new_metrics.swap(metrics);
+                new_gpu_metrics.swap(client_gpu_metrics);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -262,7 +359,30 @@ void Metrics::update_client() {
 
         {
             std::lock_guard lock(m);
-            new_metrics.swap(client_metrics);
+
+            const auto timestamp = std::chrono::steady_clock::now();
+
+            if (last_client_history_sample.time_since_epoch().count() == 0 ||
+                timestamp - last_client_history_sample >= std::chrono::milliseconds(500)) {
+
+                record_metric_history(
+                    new_metrics,
+                    client_metrics_history,
+                    timestamp);
+
+                last_client_history_sample = timestamp;
+                }
+
+                // Remove history belonging to clients no longer reporting metrics.
+                for (auto it = client_metrics_history.begin();
+                     it != client_metrics_history.end();) {
+                    if (new_metrics.find(it->first) == new_metrics.end())
+                        it = client_metrics_history.erase(it);
+                    else
+                        ++it;
+                     }
+
+                     new_metrics.swap(client_metrics);
         }
         populate_tables(clients);
         std::this_thread::sleep_for(std::chrono::milliseconds(7));
@@ -299,7 +419,14 @@ std::string Metrics::system_json_snapshot() {
         }
         out += "\"metrics\":";
         out += metrics_to_json(metrics.at(group));
-        out.push_back('}');
+
+        if (auto history_group = metrics_history.find(group);
+            history_group != metrics_history.end()) {
+            out += ",\"history\":";
+        out += metric_history_to_json(history_group->second);
+            }
+
+            out.push_back('}');
     }
 
     out += "}}";
@@ -349,6 +476,7 @@ std::string Metrics::clients_json_snapshot() {
 }
 
 Metric Metrics::get(const char* a, const char* b, const pid_t pid = 0)
+
 {
     Metric null_out;
     if (!a || !b) {
@@ -403,6 +531,73 @@ Metric Metrics::get(const char* a, const char* b, const pid_t pid = 0)
     return null_out;
 }
 
+MetricHistory Metrics::get_history(const char* a, const char* b, const pid_t pid)
+{
+    if (!a || !b) {
+        SPDLOG_ERROR("Metric history query with null key a={} b={}",
+                     (const void*)a, (const void*)b);
+        return {};
+    }
+
+    std::lock_guard<std::mutex> lock(m);
+
+    // Per-process GPU metrics take precedence over other sources.
+    if (auto client = client_gpu_metrics.find(pid);
+        client != client_gpu_metrics.end()) {
+        if (auto group = client->second.find(a);
+            group != client->second.end()) {
+            if (group->second.find(b) != group->second.end()) {
+                auto history = client_gpu_metrics_history.find(pid);
+                if (history == client_gpu_metrics_history.end())
+                    return {};
+
+                auto history_group = history->second.find(a);
+                if (history_group == history->second.end())
+                    return {};
+
+                auto metric = history_group->second.find(b);
+                return metric != history_group->second.end()
+                ? metric->second
+                : MetricHistory{};
+            }
+            }
+        }
+
+        // GLOBAL references with a PID resolve to that client's metrics.
+        if (std::strcmp(a, "GLOBAL") == 0 && pid > 0) {
+            const auto group_name = std::to_string(pid);
+
+            auto client = client_metrics.find(group_name);
+            if (client == client_metrics.end() ||
+                client->second.find(b) == client->second.end())
+                return {};
+
+            auto history_group = client_metrics_history.find(group_name);
+            if (history_group == client_metrics_history.end())
+                return {};
+
+            auto metric = history_group->second.find(b);
+            return metric != history_group->second.end()
+            ? metric->second
+            : MetricHistory{};
+        }
+
+        // Otherwise resolve against system metrics.
+        auto current_group = metrics.find(a);
+        if (current_group == metrics.end() ||
+            current_group->second.find(b) == current_group->second.end())
+            return {};
+
+        auto history_group = metrics_history.find(a);
+        if (history_group == metrics_history.end())
+            return {};
+
+    auto metric = history_group->second.find(b);
+    return metric != history_group->second.end()
+    ? metric->second
+    : MetricHistory{};
+}
+
 void Metrics::populate_tables(const std::vector<std::shared_ptr<Client>>& clients)
 {
     if (!cfg->hud)
@@ -451,9 +646,51 @@ void Metrics::assign_values(hudTable* t, pid_t pid, hudTable* render_table) {
     render_table->trim_background = t->trim_background;
     render_table->rows.reserve(t->rows.size());
     for (auto& row : t->rows) {
+        // Resolve a dedicated graph row separately from ordinary cells.
+        if (row.graph) {
+            GraphCell graph = *row.graph;
+
+            Metric metric = get(
+                graph.ref.a.c_str(), graph.ref.b.c_str(), pid);
+
+            // Existing vector-based metrics, such as FRAMETIMES.
+            if (metric.val &&
+                std::holds_alternative<std::vector<float>>(*metric.val)) {
+                graph.data = std::get<std::vector<float>>(*metric.val);
+                } else {
+                    // Historical scalar metrics.
+                    MetricHistory history = get_history(
+                        graph.ref.a.c_str(), graph.ref.b.c_str(), pid);
+
+                    if (!history.empty()) {
+                        const auto origin = history.front().timestamp;
+
+                        graph.data.reserve(history.size());
+                        graph.timestamps.reserve(history.size());
+
+                        for (const auto& sample : history) {
+                            graph.data.push_back(static_cast<float>(sample.value));
+
+                            const auto elapsed =
+                            std::chrono::duration<float, std::milli>(
+                                sample.timestamp - origin).count();
+
+                                graph.timestamps.push_back(elapsed);
+                        }
+                    }
+                }
+
+                render_table->rows.push_back(HudTableRow{
+                    .cells = {},
+                    .graph = std::move(graph),
+                });
+                continue;
+        }
+
         std::vector<MaybeCell> parsed_row;
         parsed_row.reserve(t->cols);
-        for (auto& cell : row) {
+
+        for (auto& cell : row.cells) {
             TextCell out {};
             if (!cell.has_value()) {
                 parsed_row.push_back(std::nullopt);
@@ -537,11 +774,37 @@ void Metrics::assign_values(hudTable* t, pid_t pid, hudTable* render_table) {
 
             if (std::holds_alternative<GraphCell>(c)) {
                 auto& gc = std::get<GraphCell>(c);
-                std::vector<float> data;
                 out.style = gc.style;
+                out.graph_min = gc.min;
+                out.graph_max = gc.max;
+
                 Metric metric = get(gc.ref.a.c_str(), gc.ref.b.c_str(), pid);
-                if (metric.val && std::holds_alternative<std::vector<float>>(*metric.val))
+
+                // Existing vector-based metrics, such as FRAMETIMES.
+                if (metric.val && std::holds_alternative<std::vector<float>>(*metric.val)) {
                     out.data = std::get<std::vector<float>>(*metric.val);
+                } else {
+                    // Historical scalar metrics.
+                    MetricHistory history = get_history(
+                        gc.ref.a.c_str(), gc.ref.b.c_str(), pid);
+
+                    if (!history.empty()) {
+                        const auto origin = history.front().timestamp;
+
+                        out.data.reserve(history.size());
+                        out.timestamps.reserve(history.size());
+
+                        for (const auto& sample : history) {
+                            out.data.push_back(static_cast<float>(sample.value));
+
+                            const auto elapsed =
+                            std::chrono::duration<float, std::milli>(
+                                sample.timestamp - origin).count();
+
+                                out.timestamps.push_back(elapsed);
+                        }
+                    }
+                }
 
                 parsed_row.push_back(std::move(out));
                 continue;
@@ -661,7 +924,10 @@ void Metrics::assign_values(hudTable* t, pid_t pid, hudTable* render_table) {
                     value.style.separator_vec = color.get(value.style.separator_color);
             }, *cell);
         }
-        render_table->rows.push_back(std::move(parsed_row));
+        render_table->rows.push_back(HudTableRow{
+            .cells = std::move(parsed_row),
+                                     .graph = std::nullopt,
+        });
     }
 }
 

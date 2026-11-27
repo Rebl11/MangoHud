@@ -11,6 +11,8 @@
 #include "exec.h"
 #include "../../ipc/ipc.h"
 #include "../../render/colors.h"
+#include <deque>
+#include <chrono>
 
 using MetricValue = std::variant<int, uint64_t, float, std::vector<float>, std::string>;
 struct Metric {
@@ -19,12 +21,24 @@ struct Metric {
 };
 using MetricTable = std::unordered_map<std::string,
                    std::unordered_map<std::string, Metric>>;
+struct MetricSample {
+    std::chrono::steady_clock::time_point timestamp;
+    double value;
+};
+
+using MetricHistory = std::deque<MetricSample>;
+
+using MetricHistoryTable = std::unordered_map<
+    std::string,
+    std::unordered_map<std::string, MetricHistory>>;
+
 class Metrics {
 public:
     std::shared_ptr<Config> cfg;
     Metrics(IPCServer& ipc, std::shared_ptr<Config> cfg_);
     void update();
     Metric get(const char* a, const char* b, const pid_t pid);
+    MetricHistory get_history(const char* a, const char* b, const pid_t pid);
     void update_table();
     void update_client();
     void add_client_pid(pid_t pid);
@@ -53,7 +67,11 @@ private:
     Exec exec;
     MetricTable metrics;
     MetricTable client_metrics;
+    MetricHistoryTable metrics_history;
+    MetricHistoryTable client_metrics_history;
+    std::unordered_map<pid_t, MetricHistoryTable> client_gpu_metrics_history;
     std::unordered_map<pid_t, MetricTable> client_gpu_metrics;
+    std::chrono::steady_clock::time_point last_client_history_sample{};
 
     void populate_tables(const std::vector<std::shared_ptr<Client>>& clients);
     void assign_values(hudTable* t, pid_t pid, hudTable* render_table);
